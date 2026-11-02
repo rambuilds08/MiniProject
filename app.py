@@ -1,259 +1,168 @@
 import streamlit as st
-from PIL import Image
 import numpy as np
+import cv2
 import tensorflow as tf
-from sklearn.metrics import accuracy_score, precision_score, recall_score, mean_squared_error, confusion_matrix
-import matplotlib.pyplot as plt
-import seaborn as sns
+from PIL import Image
+import os
 import matplotlib.cm as cm
-import matplotlib.colors as mcolors
 
-# 1. Load the AI Brain
+# ==========================================
+# PAGE CONFIGURATION & HEADER
+# ==========================================
+st.set_page_config(
+    page_title="ThoraxScan AI - Diagnostic Triage",
+    page_icon="🫁",
+    layout="wide"
+)
+
+st.title("🫁 ThoraxScan AI: Respiratory Disease Triage & Explainability")
+st.markdown("""
+**Educational Research & Decision Support System**  
+An explainable deep learning pipeline for multi-class classification of Chest X-rays (COVID-19, Pneumonia, Tuberculosis, Normal) utilizing **DenseNet-121** and **Grad-CAM visual heatmaps**.
+""")
+st.divider()
+
+# ==========================================
+# MODEL CONFIGURATION & CACHED LOAD
+# ==========================================
+MODEL_PATH = "Xscan_real_model.h5"
+CLASSES = ["COVID-19", "Normal", "Pneumonia", "Tuberculosis"]
+
 @st.cache_resource
-def load_xscan_model():
-    return tf.keras.models.load_model('Xscan_real_model.h5')
+def load_trained_model():
+    if not os.path.exists(MODEL_PATH):
+        return None
+    try:
+        return tf.keras.models.load_model(MODEL_PATH)
+    except Exception as e:
+        st.error(f"Error loading model binary: {e}")
+        return None
 
-model = load_xscan_model()
+model = load_trained_model()
 
+if model is None:
+    st.error(f"⚠️ **Model File Missing (`{MODEL_PATH}`)**")
+    st.info("Please upload `Xscan_real_model.h5` to the root directory of your GitHub repository to enable live inference.")
+    st.stop()
 
+# ==========================================
+# IMAGE PROCESSING & GRAD-CAM PIPELINE
+# ==========================================
+def preprocess_image(img_arr):
+    # Grayscale conversion using OpenCV
+    if len(img_arr.shape) == 3 and img_arr.shape[2] == 3:
+        gray = cv2.cvtColor(img_arr, cv2.COLOR_RGB2GRAY)
+    else:
+        gray = img_arr
+        
+    # Contrast Limited Adaptive Histogram Equalization (CLAHE)
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    enhanced = clahe.apply(gray)
+    
+    # 3-channel scaling for DenseNet backbone & normalization to [0, 1]
+    rgb_img = cv2.cvtColor(enhanced, cv2.COLOR_GRAY2RGB)
+    resized_img = cv2.resize(rgb_img, (224, 224))
+    normalized_img = resized_img.astype(np.float32) / 255.0
+    return np.expand_dims(normalized_img, axis=0), resized_img
 
-def make_gradcam_heatmap(img_array, model):
+def compute_gradcam(model, processed_tensor, target_layer_name=None):
+    if target_layer_name is None:
+        # Auto-detect final convolutional layer for DenseNet / ResNet architectures
+        for layer in reversed(model.layers):
+            if isinstance(layer, (tf.keras.layers.Conv2D, tf.keras.layers.Concatenate)):
+                target_layer_name = layer.name
+                break
+        if not target_layer_name:
+            target_layer_name = model.layers[-4].name
+
+    grad_model = tf.keras.models.Model(
+        inputs=[model.inputs],
+        outputs=[model.get_layer(target_layer_name).output, model.output]
+    )
+
     with tf.GradientTape() as tape:
-        x = img_array
-        
-        densenet_layer = model.get_layer('densenet121')
-        densenet_idx = model.layers.index(densenet_layer)
-        
-        # Walk through early layers (Rescaling, Augmentation)
-        for layer in model.layers[1:densenet_idx]: # Skip the input layer at index 0
-            if "augmentation" in layer.name:
-                x = layer(x, training=False) # Tell augmentation NOT to flip/zoom
-            else:
-                x = layer(x) # Rescaling just takes the input naturally
-            
-        # Pass through DenseNet to get the final feature map
-        last_conv_output = densenet_layer(x, training=False)
-        tape.watch(last_conv_output)
-        
-        # Pass through the remaining top layers
-        preds = last_conv_output
-        for layer in model.layers[densenet_idx+1:]:
-            preds = layer(preds)
-            
-        pred_index = tf.argmax(preds[0])
-        class_channel = preds[:, pred_index]
+        conv_outputs, predictions = grad_model(processed_tensor)
+        top_pred_index = tf.argmax(predictions[0])
+        class_channel = predictions[:, top_pred_index]
 
-    # Calculate the gradients!
-    grads = tape.gradient(class_channel, last_conv_output)
+    grads = tape.gradient(class_channel, conv_outputs)
     pooled_grads = tf.reduce_mean(grads, axis=(0, 1, 2))
     
-    # Apply the gradients to the feature map to create the heatmap
-    last_conv_output = last_conv_output[0]
-    heatmap = last_conv_output @ pooled_grads[..., tf.newaxis]
+    conv_outputs = conv_outputs[0]
+    heatmap = conv_outputs @ pooled_grads[..., tf.newaxis]
     heatmap = tf.squeeze(heatmap)
     
-    # Normalize between 0 and 1
-    heatmap = tf.maximum(heatmap, 0) / tf.math.reduce_max(heatmap)
-    
+    # Normalize heatmap safely
+    heatmap = tf.maximum(heatmap, 0)
+    max_val = tf.math.reduce_max(heatmap)
+    if max_val != 0:
+        heatmap = heatmap / max_val
     return heatmap.numpy()
-def overlay_heatmap(img_path, heatmap, alpha=0.4):
-    # Load original image
-    img = tf.keras.preprocessing.image.load_img(img_path)
-    img = tf.keras.preprocessing.image.img_to_array(img)
 
-    # Rescale heatmap
-    heatmap = np.uint8(255 * heatmap)
-    jet = cm.get_cmap("jet")
-    jet_colors = jet(np.arange(256))[:, :3]
-    jet_heatmap = jet_colors[heatmap]
-
-    # Superimpose
-    jet_heatmap = tf.keras.preprocessing.image.array_to_img(jet_heatmap)
-    jet_heatmap = jet_heatmap.resize((img.shape[1], img.shape[0]))
-    jet_heatmap = tf.keras.preprocessing.image.img_to_array(jet_heatmap)
-
-    superimposed_img = jet_heatmap * alpha + img
-    superimposed_img = tf.keras.preprocessing.image.array_to_img(superimposed_img)
-    return superimposed_img
-
-# CRITICAL FIX: These must match the alphabetical order of your exact folder names
-# We map them to pretty display names for the UI.
-folder_names = ['covid', 'normal', 'pnemonia', 'tb']
-display_classes = ['COVID-19', 'Normal', 'Pneumonia', 'Tuberculosis']
-
-# 2. Calculation Logic
-# 2. Calculation Logic (Updated for Visibility)
-def calculate_system_metrics(test_ds):
-    y_true = []
-    y_pred = []
-    y_probs = []
-
-    # Total number of images
-    num_samples = test_ds.samples
-    # Create a progress bar in the Streamlit UI
-    progress_text = "Operation in progress. Please wait."
-    my_bar = st.progress(0, text=progress_text)
+def overlay_heatmap(original_img, heatmap, alpha=0.4):
+    heatmap_uint8 = np.uint8(255 * heatmap)
+    colormap = cm.get_cmap("jet")
+    colormap_colors = colormap(np.arange(256))[:, :3]
+    jet_heatmap = colormap_colors[heatmap_uint8]
     
-    # We iterate through the generator manually to track progress
-    # batch_size=1 makes this easier to track 1-by-1
-    for i in range(num_samples):
-        # Get next image and label
-        img, label = next(test_ds)
-        
-        # Predict (verbose=1 will now show progress in PowerShell)
-        preds = model.predict(img, verbose=1) 
-        
-        y_probs.extend(preds)
-        y_pred.append(np.argmax(preds, axis=1)[0])
-        y_true.append(np.argmax(label, axis=1)[0])
-        
-        # Update progress bar in browser
-        percent_complete = (i + 1) / num_samples
-        my_bar.progress(percent_complete, text=f"Analyzing Image {i+1} of {num_samples}...")
+    jet_heatmap = cv2.resize(jet_heatmap, (original_img.shape[1], original_img.shape[0]))
+    overlay = jet_heatmap * alpha + (original_img / 255.0)
+    return np.clip(overlay, 0, 1)
 
-    # Convert to numpy arrays
-    y_true = np.array(y_true)
-    y_pred = np.array(y_pred)
-    y_probs = np.array(y_probs)
-
-    # Calculate final stats
-    acc = accuracy_score(y_true, y_pred)
-    prec = precision_score(y_true, y_pred, average='weighted', zero_division=0)
-    rec = recall_score(y_true, y_pred, average='weighted', zero_division=0)
-    
-    y_true_oh = tf.keras.utils.to_categorical(y_true, num_classes=4)
-    mse = mean_squared_error(y_true_oh, y_probs)
-    cm = confusion_matrix(y_true, y_pred)
-
-    # Remove the progress bar when done
-    my_bar.empty()
-
-    return acc, prec, rec, mse, cm
-
-# 3. UI Layout
-st.set_page_config(page_title="XScan AI | Research Analytics", layout="wide")
-st.title("XScan AI")
-st.subheader("Multi-Class Respiratory Disease Detection System")
-
-# --- Performance Calculation & Graph Section ---
-st.sidebar.header("Model Validation")
-if st.sidebar.button("Run System Validation"):
-    with st.spinner("Analyzing test directory & generating graphs..."):
-        try:
-            test_datagen = tf.keras.preprocessing.image.ImageDataGenerator(rescale=1./255)
-            
-            # Make sure this path points to the 'test' folder in your screenshot
-            test_generator = test_datagen.flow_from_directory(
-                'test', 
-                target_size=(224, 224),
-                batch_size=1,
-                class_mode='categorical',
-                shuffle=False # MUST be False to keep true labels aligned with predictions
-            )
-
-            acc, prec, rec, mse, cm = calculate_system_metrics(test_generator)
-
-            # Display the calculated metrics
-            st.markdown("### 📊 Calculated Performance Metrics")
-            c1, c2, c3, c4 = st.columns(4)
-            c1.metric("Accuracy", f"{acc:.2%}")
-            c2.metric("Precision", f"{prec:.2%}")
-            c3.metric("Recall", f"{rec:.2%}")
-            c4.metric("MSE", f"{mse:.4f}")
-            
-            st.markdown("---")
-            
-            # Display the Confusion Matrix Graph
-            st.markdown("### 📉 Confusion Matrix Result Analysis")
-            fig, ax = plt.subplots(figsize=(8, 6))
-            sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', 
-                        xticklabels=display_classes, 
-                        yticklabels=display_classes, 
-                        ax=ax)
-            plt.ylabel('Actual Diagnosis', fontsize=12)
-            plt.xlabel('AI Predicted Diagnosis', fontsize=12)
-            plt.title('XScan AI Classification Results', fontsize=14)
-            
-            # Render graph in Streamlit
-            st.pyplot(fig)
-           
-
-        except Exception as e:
-            st.error(f"Error loading test set: {e}. Make sure the 'test' folder is in the same directory as this script.")
-
-st.markdown("---")
-
-## 4. Inference Section (Single Image Upload)
-st.markdown("---")
-st.markdown("### 🩺 Live Patient Scan")
-uploaded_file = st.file_uploader("Upload a Chest X-Ray for Live Analysis", type=["png", "jpg", "jpeg"])
+# ==========================================
+# INTERACTIVE DIAGNOSTIC DASHBOARD
+# ==========================================
+uploaded_file = st.file_uploader(
+    "Upload Patient Chest X-Ray Scan (PNG, JPG, JPEG)", 
+    type=["png", "jpg", "jpeg"]
+)
 
 if uploaded_file is not None:
-    # 1. Display the original uploaded image
-    st.image(uploaded_file, caption="Uploaded Chest X-Ray", use_container_width=True)
+    raw_image = Image.open(uploaded_file).convert('RGB')
+    img_array = np.array(raw_image)
     
-    if st.button("Run AI Analysis"):
-        with st.spinner("Analyzing scan and generating heatmap..."):
-          # Prepare image array
-            img = Image.open(uploaded_file).convert('RGB')
-            img = img.resize((224, 224))
-            img_array = tf.keras.preprocessing.image.img_to_array(img)
-            
-            # Remove the / 255.0! The new model handles it internally.
-            img_array = np.expand_dims(img_array, axis=0)
-            
-            # Predict
-            predictions = model.predict(img_array)
-            confidence = np.max(predictions) * 100
-            classes = ['COVID-19', 'Normal', 'Pneumonia', 'Tuberculosis']
-            predicted_class = classes[np.argmax(predictions)]
-            
-            # Generate Heatmap
-            # (We temporarily remove softmax to get raw gradients, then put it back)
-           # Generate Heatmap
-            # (We temporarily remove softmax to get raw gradients, then put it back)
-            model.layers[-1].activation = None
-            
-            # UPDATE: Tell Grad-CAM to target the nested base model layer!
-            heatmap = make_gradcam_heatmap(img_array, model)
-            
-            model.layers[-1].activation = tf.keras.activations.softmax
-            
-            # ... (your existing prediction and heatmap generation code) ...
-            
-            final_img = overlay_heatmap(uploaded_file, heatmap)
+    tensor_input, resized_rgb = preprocess_image(img_array)
+    
+    with st.spinner("Executing DenseNet-121 feature extraction & Grad-CAM visual synthesis..."):
+        predictions = model.predict(tensor_input)
+        pred_idx = int(np.argmax(predictions[0]))
+        confidence_score = float(predictions[0][pred_idx]) * 100
+        predicted_class = CLASSES[pred_idx]
+        
+        # Generate Explainability Overlay
+        heatmap = compute_gradcam(model, tensor_input)
+        heatmap_overlay = overlay_heatmap(resized_rgb, heatmap)
 
-            # --- DISPLAY RESULTS ---
-            st.success("Analysis Complete!")
-            
-            col1, col2 = st.columns(2)
-            
-            with col1:
-                st.markdown(f"### 🩺 Diagnosis: **{predicted_class}**")
-                st.info(f"**Confidence Score:** {confidence:.2f}%")
-                
-                with st.expander("View detailed probabilities"):
-                    for i, class_name in enumerate(classes):
-                        st.write(f"- {class_name}: {predictions[0][i] * 100:.2f}%")
-                        
-            with col2:
-                # 1. Create a matplotlib figure
-                fig, ax = plt.subplots(figsize=(6, 6))
-                
-                # 2. Display the superimposed image on the axis
-                ax.imshow(final_img)
-                ax.axis('off') # Hide the standard chart x/y axes
-                
-                # 3. Build the standalone colorbar
-                norm = mcolors.Normalize(vmin=0, vmax=1)
-                sm = cm.ScalarMappable(cmap='jet', norm=norm)
-                sm.set_array([])
-                
-                # 4. Attach the colorbar to the side and format the labels
-                cbar = fig.colorbar(sm, ax=ax, fraction=0.046, pad=0.04)
-                cbar.set_ticks([0, 0.5, 1])
-                cbar.set_ticklabels(['Low', 'Medium', 'High'])
-                cbar.set_label('Pathology Activation Intensity', rotation=270, labelpad=15)
-                
-                # 5. Render the entire figure in Streamlit (UPDATED LINE)
-                st.pyplot(fig, use_container_width=True)
+    col1, col2 = st.columns(2)
+    
+    with col1:
+        st.subheader("📷 Input Chest X-Ray")
+        st.image(raw_image, use_container_width=True)
+        
+    with col2:
+        st.subheader("🔥 Grad-CAM Pathology Heatmap")
+        st.image(heatmap_overlay, use_container_width=True, clamp=True)
+        st.caption("Warm regions (Red/Yellow) highlight anatomical patterns driving the network's classification.")
+
+    st.markdown("---")
+    st.subheader("📊 Diagnostic Summary & Multi-Class Confidence")
+    
+    if predicted_class == "Normal":
+        st.success(f"**Predicted Diagnosis:** {predicted_class} (Confidence: {confidence_score:.2f}%)")
+    else:
+        st.error(f"**Predicted Diagnosis:** {predicted_class} (Confidence: {confidence_score:.2f}%)")
+        
+    st.write("### Class Probability Breakdown:")
+    for idx, class_name in enumerate(CLASSES):
+        prob = float(predictions[0][idx])
+        st.progress(prob, text=f"{class_name}: {prob*100:.2f}%")
+
+st.sidebar.markdown("""
+### About ThoraxScan AI
+* **Architecture:** DenseNet-121 (Transfer Learning)
+* **Pre-processing:** OpenCV CLAHE Grayscale Optimization
+* **Explainability:** Grad-CAM (XAI)
+* **Goal:** Triage assistance for resource-constrained clinics.
+
+*Disclaimer: For research and academic demo purposes only.*
+""")
