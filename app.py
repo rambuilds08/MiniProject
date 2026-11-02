@@ -5,6 +5,9 @@ import tensorflow as tf
 from PIL import Image
 import os
 import matplotlib.cm as cm
+import gdown
+
+
 
 # ==========================================
 # PAGE CONFIGURATION & HEADER
@@ -25,13 +28,22 @@ st.divider()
 # ==========================================
 # MODEL CONFIGURATION & CACHED LOAD
 # ==========================================
-MODEL_PATH = "Xscan_real_model.h5"
+
 CLASSES = ["COVID-19", "Normal", "Pneumonia", "Tuberculosis"]
+
+
+
+MODEL_PATH = "Xscan_real_model.h5"
+# Replace with your actual Google Drive File ID
+GDRIVE_FILE_ID = "1dXveu4UoHLeFfddmAxkITCHTYOGUIn3U"
 
 @st.cache_resource
 def load_trained_model():
     if not os.path.exists(MODEL_PATH):
-        return None
+        with st.spinner("Downloading trained model weights (first-time startup)..."):
+            url = f"https://drive.google.com/uc?id={GDRIVE_FILE_ID}"
+            gdown.download(url, MODEL_PATH, quiet=False)
+            
     try:
         return tf.keras.models.load_model(MODEL_PATH)
     except Exception as e:
